@@ -142,25 +142,29 @@ def _extract_message_body(msg: dict) -> str:
     # text/plain. The previous implementation only inspected the first level
     # of ``payload["parts"]`` and returned an empty body for any message whose
     # text/plain (or text/html) part lived deeper — common for HTML and
-    # marketing mail. Prefer text/plain anywhere in the tree, then fall back
-    # to text/html anywhere in the tree.
+    # marketing mail. Collect every text/plain leaf so forwarded-as-attachment
+    # messages retain both their wrapper and nested message/rfc822 body, then
+    # fall back to all text/html leaves when no plain text exists.
     payload = msg.get("payload", {})
 
-    def _walk(part: dict, want: str) -> str:
+    def _walk(part: dict, want: str) -> list[str]:
+        found = []
         if part.get("mimeType") == want and part.get("body", {}).get("data"):
-            return base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
+            found.append(
+                base64.urlsafe_b64decode(part["body"]["data"]).decode(
+                    "utf-8", errors="replace"
+                )
+            )
         for sub in part.get("parts", []) or []:
-            found = _walk(sub, want)
-            if found:
-                return found
-        return ""
+            found.extend(_walk(sub, want))
+        return found
 
     if payload.get("body", {}).get("data"):
         return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
     for want in ("text/plain", "text/html"):
-        found = _walk(payload, want)
-        if found:
-            return found
+        bodies = _walk(payload, want)
+        if bodies:
+            return "\n\n".join(bodies)
     return ""
 
 

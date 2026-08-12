@@ -370,6 +370,50 @@ def test_extract_body_prefers_plain_over_html_across_tree(api_module):
     assert api_module._extract_message_body(msg) == "deep plain"
 
 
+def test_extract_body_includes_wrapper_and_forwarded_rfc822(api_module):
+    # Regression for #43054: a forward-as-attachment message can contain a
+    # top-level wrapper plus the real body inside message/rfc822. Returning
+    # only the first text/plain part silently drops the forwarded message.
+    msg = {
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "parts": [
+                {
+                    "mimeType": "text/plain",
+                    "body": {"data": _b64("FYI - see the note below.")},
+                },
+                {
+                    "mimeType": "message/rfc822",
+                    "parts": [
+                        {
+                            "mimeType": "multipart/alternative",
+                            "parts": [
+                                {
+                                    "mimeType": "text/plain",
+                                    "body": {
+                                        "data": _b64(
+                                            "ORIGINAL MESSAGE: dinner moved to Thursday 7pm."
+                                        )
+                                    },
+                                },
+                                {
+                                    "mimeType": "text/html",
+                                    "body": {"data": _b64("<p>html copy</p>")},
+                                },
+                            ],
+                        }
+                    ],
+                },
+            ],
+        }
+    }
+
+    assert api_module._extract_message_body(msg) == (
+        "FYI - see the note below.\n\n"
+        "ORIGINAL MESSAGE: dinner moved to Thursday 7pm."
+    )
+
+
 def test_extract_body_empty_when_no_text_parts(api_module):
     msg = {
         "payload": {
