@@ -498,18 +498,82 @@ def _handle_control_action(
                     ),
                     "accepting_steer": bool(r.get("accepting_steer", False)),
                     "live_transcript": getattr(agent, "_live_transcript_path", None),
+                    "source": "live",
                 }
             )
+
+        # Also surface async (background) delegations dispatched from this
+        # conversation.  They run outside the _active_subagents registry, so
+        # the live scan above misses them.  list_async_delegations() returns
+        # every record across all sessions — scope down to the caller's own
+        # origin_session (the durable session id stamped at dispatch time).
+        parent_sid = str(getattr(parent_agent, "session_id", "") or "")
+        async_entries: List[Dict[str, Any]] = []
+        if parent_sid:
+            try:
+                from tools.async_delegation import list_async_delegations
+
+                for ad in list_async_delegations():
+                    # Match against session_key (what the dispatch stored as
+                    # origin_session in the durable DB) or parent_session_id
+                    # (the durable AIAgent.session_id — matches across all
+                    # surfaces: CLI, Telegram, TUI, desktop).
+                    if (
+                        ad.get("session_key") != parent_sid
+                        and ad.get("parent_session_id") != parent_sid
+                    ):
+                        continue
+                    # In-memory records carry goals (batch) or goal (single).
+                    # Per-task status/api_calls only exist in the completion
+                    # result — while running we show just the goals.
+                    goals = ad.get("goals") or ([ad.get("goal")] if ad.get("goal") else [])
+                    ae: Dict[str, Any] = {
+                        "delegation_id": ad.get("delegation_id"),
+                        "status": ad.get("status"),
+                        "delivery_state": ad.get("delivery_state"),
+                        "model": ad.get("model"),
+                        "dispatched_at": ad.get("dispatched_at"),
+                        "seconds_since_progress": ad.get("seconds_since_progress"),
+                        "is_batch": bool(ad.get("is_batch")),
+                        "task_count": len(goals),
+                        "tasks": [
+                            {
+                                "index": i,
+                                "goal": (
+                                    (g or "")[:120]
+                                    + ("…" if len(g or "") > 120 else "")
+                                ),
+                            }
+                            for i, g in enumerate(goals)
+                        ],
+                        "source": "async",
+                    }
+                    # Live activity sampling (available while running/stalling)
+                    if ad.get("in_tool"):
+                        ae["in_tool"] = True
+                    children_activity = ad.get("children_activity")
+                    if children_activity:
+                        ae["children_activity"] = children_activity
+                    async_entries.append(ae)
+            except Exception:
+                pass
+
+        entries.extend(async_entries)
+
         payload: Dict[str, Any] = {
             "action": "list",
             "count": len(entries),
             "subagents": entries,
+            "breakdown": {
+                "live": sum(1 for e in entries if e.get("source") == "live"),
+                "async": sum(1 for e in entries if e.get("source") == "async"),
+            },
         }
         if not entries:
             payload["note"] = (
-                "No live subagents right now. Children that already finished "
-                "have delivered (or will deliver) their results as normal "
-                "completion messages — there is nothing to steer or stop."
+                "No live or async subagents right now. Children that already "
+                "finished have delivered (or will deliver) their results as "
+                "normal completion messages — there is nothing to steer or stop."
             )
         return json.dumps(payload, ensure_ascii=False)
 
@@ -4865,7 +4929,9 @@ DELEGATE_TASK_SCHEMA = {
                     "a handle immediately and results re-enter the conversation as "
                     "new messages when subagents finish. The human channel stays "
                     "open in the meantime. Note: stateless sessions (cron, kanban "
-                    "workers, hermes -z) fall back to synchronous automatically."
+                    "workers, hermes -z) fall back to synchronous automatically. "
+                    "The operator can disable this globally via "
+                    "`hermes config set delegation.async_delegation_enabled false`."
                 ),
             },
             "action": {
@@ -4913,8 +4979,9 @@ from tools.registry import registry, tool_error
 def _model_background_value(args: dict, parent_agent=None) -> bool:
     """Background flag for the MODEL-facing dispatch path (registry fallback).
 
-    Delegations from the top-level agent always run in the background — the
-    model does not choose. This applies to both a single task and a fan-out
+    Delegations from the top-level agent run in the background by default
+    (configurable via ``delegation.async_delegation_enabled``) — the model
+    does not choose. This applies to both a single task and a fan-out
     batch (the whole batch is one async unit that joins on all children and
     returns one consolidated result). The one
     exception is a delegation from an orchestrator subagent (depth > 0), which
@@ -4924,7 +4991,16 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     keep the historical synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    if is_subagent:
+        return False
+    # Check the feature flag — allows users to toggle async delegation
+    # via `hermes config set delegation.async_delegation_enabled false`
+    try:
+        cfg = _load_config()
+        enabled = cfg.get("async_delegation_enabled", True)
+        return bool(enabled)
+    except Exception:
+        return True
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}

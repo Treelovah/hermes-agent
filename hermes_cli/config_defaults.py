@@ -1881,6 +1881,14 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Run delegate_task dispatches asynchronously by default. When true
+        # (default), the tool returns a handle immediately — subagents run in
+        # the background and their results re-enter the conversation as new
+        # messages. The human channel stays open. Set to false to restore the
+        # legacy synchronous behavior where the parent turn blocks until all
+        # children finish. Stateless sessions (cron, hermes -z, kanban workers)
+        # always run synchronously regardless.
+        "async_delegation_enabled": True,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
