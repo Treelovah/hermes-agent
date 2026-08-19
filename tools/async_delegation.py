@@ -1226,6 +1226,73 @@ def _push_batch_completion_event(
         )
 
 
+def push_per_child_completion_event(
+    delegation_id: str,
+    task_index: int,
+    total_tasks: int,
+    goal: str,
+    entry: Dict[str, Any],
+    event_record: Dict[str, Any],
+) -> None:
+    """Push a per-child completion event for ONE task within a batch.
+
+    Called from ``_execute_and_aggregate`` as each child finishes, so the
+    delegator sees incremental progress instead of waiting for ALL children
+    before getting any signal. The batch-complete event still fires at the
+    end (via ``_push_batch_completion_event``) with the consolidated results.
+
+    Best-effort only — a failure here must not crash the batch runner.
+    """
+    try:
+        from tools.process_registry import process_registry
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "Per-child completion for delegation %s task %d: "
+            "process_registry import failed: %s",
+            delegation_id, task_index, exc,
+        )
+        return
+
+    completed_at = time.time()
+    dispatched_at = event_record.get("dispatched_at") or completed_at
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": delegation_id,
+        "session_key": event_record.get("session_key", ""),
+        "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
+        "origin_session_id": event_record.get("origin_session_id", ""),
+        "parent_session_id": event_record.get("parent_session_id"),
+        "goal": goal,
+        "context": event_record.get("context"),
+        "toolsets": event_record.get("toolsets"),
+        "role": event_record.get("role"),
+        "model": entry.get("model") or event_record.get("model"),
+        "status": entry.get("status", "error"),
+        "is_batch": True,
+        "per_child": True,
+        "task_index": task_index,
+        "total_tasks": total_tasks,
+        "summary": entry.get("summary"),
+        "error": entry.get("error"),
+        "api_calls": entry.get("api_calls", 0),
+        "duration_seconds": entry.get("duration_seconds", 0),
+        "dispatched_at": dispatched_at,
+        "completed_at": completed_at,
+        "live_transcripts": [entry.get("live_transcript")] if entry.get("live_transcript") else [],
+    }
+    for _k in ("scope_id", "user_id", "user_name"):
+        if event_record.get(_k):
+            evt[_k] = event_record[_k]
+    try:
+        process_registry.completion_queue.put(evt)
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "Per-child completion for delegation %s task %d: "
+            "failed to enqueue: %s",
+            delegation_id, task_index, exc,
+        )
+
+
 def _ensure_stale_monitor() -> None:
     """Start (once) the module-level stale-delegation monitor thread.
 

@@ -3663,7 +3663,7 @@ def delegate_task(
     # carrying the consolidated per-task results. It re-enters the conversation
     # as one message once ALL children finish — the chat is not blocked while
     # they run.
-    background = is_truthy_value(background, default=False) if background is not None else False
+    background = is_truthy_value(background, default=True) if background is not None else True
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -3887,7 +3887,10 @@ def delegate_task(
             setattr(child, "_delegation_id", live_deleg_id)
         children.append((i, t, child))
 
-    def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
+    def _execute_and_aggregate(
+        *, honor_parent_interrupt: bool = True,
+        per_child_callback = None,
+    ) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
         fire subagent_stop hooks + cost rollup, and return the combined result
         dict. Used by BOTH the synchronous path and the background runner. In
@@ -4011,8 +4014,18 @@ def delegate_task(
                         results.append(entry)
                         completed_count += 1
 
-                        # Print per-task completion line above the spinner
+                        # Notify per-child callback (async delegation incremental progress)
                         idx = entry["task_index"]
+                        if per_child_callback is not None:
+                            try:
+                                per_child_callback(idx, entry)
+                            except Exception:
+                                logger.warning(
+                                    "Per-child callback failed for task %d", idx,
+                                    exc_info=True,
+                                )
+
+                        # Print per-task completion line above the spinner
                         label = (
                             task_labels[idx] if idx < len(task_labels) else f"Task {idx}"
                         )
@@ -4197,7 +4210,40 @@ def delegate_task(
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
             # owned by the async registry and cancelled only via _batch_interrupt.
-            return _execute_and_aggregate(honor_parent_interrupt=False)
+            # Wire per-child completion events so the delegator sees incremental
+            # progress instead of waiting for ALL children before any signal.
+            def _on_child_done(task_index: int, entry: dict) -> None:
+                if not live_deleg_id:
+                    return
+                from tools.async_delegation import push_per_child_completion_event
+                logger.info(
+                    "Per-child completion: deleg=%s task=%d/%d status=%s",
+                    live_deleg_id, task_index + 1, n_tasks,
+                    entry.get("status", "?"),
+                )
+                push_per_child_completion_event(
+                    delegation_id=live_deleg_id,
+                    task_index=task_index,
+                    total_tasks=n_tasks,
+                    goal=_goals[task_index] if task_index < len(_goals) else "?",
+                    entry=entry,
+                    event_record={
+                        "session_key": _session_key,
+                        "origin_ui_session_id": _origin_ui_session_id,
+                        "origin_session_id": _wake_sid,
+                        "parent_session_id": _parent_session_id,
+                        "context": context,
+                        "toolsets": None,
+                        "role": top_role,
+                        "model": creds["model"],
+                        "dispatched_at": time.time(),
+                    },
+                )
+
+            return _execute_and_aggregate(
+                honor_parent_interrupt=False,
+                per_child_callback=_on_child_done,
+            )
 
         def _batch_interrupt():
             for _c in _child_agents:
@@ -4813,13 +4859,13 @@ DELEGATE_TASK_SCHEMA = {
             "background": {
                 "type": "boolean",
                 "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
-                    "Setting this has no effect; the parameter remains only for "
-                    "backward compatibility."
+                    "Set to false to force synchronous execution (blocks until "
+                    "all subagents finish). Default is true — top-level single "
+                    "and batch delegations run in the background: the tool returns "
+                    "a handle immediately and results re-enter the conversation as "
+                    "new messages when subagents finish. The human channel stays "
+                    "open in the meantime. Note: stateless sessions (cron, kanban "
+                    "workers, hermes -z) fall back to synchronous automatically."
                 ),
             },
             "action": {
